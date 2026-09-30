@@ -12,6 +12,7 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+BATCH_RE = re.compile(r"^/api/net-batches/([A-Za-z0-9_\-]+)$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -57,7 +58,11 @@ def make_handler(service: Any, static_dir: Path):
 
         def _handle_error(self, exc: Exception) -> None:
             if isinstance(exc, DomainError):
-                self._send(exc.status, {"error": exc.code, "message": str(exc)})
+                payload: Dict[str, Any] = {"error": exc.code, "message": str(exc)}
+                details = getattr(exc, "details", None)
+                if details is not None:
+                    payload["details"] = details
+                self._send(exc.status, payload)
             else:
                 self._send(500, {"error": "internal_error", "message": "服务内部错误"})
 
@@ -76,6 +81,24 @@ def make_handler(service: Any, static_dir: Path):
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
                     self._send(200, {"items": records})
                     return
+                if parsed.path == "/api/corporate-actions":
+                    query = parse_qs(parsed.query)
+                    versions = service.list_corporate_versions(
+                        self._actor(),
+                        instrument=query.get("instrument", [None])[0],
+                        corporate_action=query.get("type", [None])[0],
+                    )
+                    self._send(200, {"items": versions})
+                    return
+                if parsed.path == "/api/net-batches":
+                    query = parse_qs(parsed.query)
+                    batches = service.list_batches(
+                        self._actor(),
+                        status=query.get("status", [None])[0],
+                        limit=int(query.get("limit", ["100"])[0]),
+                    )
+                    self._send(200, {"items": batches})
+                    return
                 match = RECORD_RE.match(parsed.path)
                 if match:
                     self._send(200, service.get_record(self._actor(), int(match.group(1))))
@@ -83,6 +106,10 @@ def make_handler(service: Any, static_dir: Path):
                 match = AUDIT_RE.match(parsed.path)
                 if match:
                     self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
+                    return
+                match = BATCH_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_batch(self._actor(), match.group(1)))
                     return
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
@@ -98,6 +125,19 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
+                    return
+                if parsed.path == "/api/corporate-actions":
+                    revision = service.publish_corporate(self._actor(), body.get("data", {}))
+                    self._send(201, revision)
+                    return
+                if parsed.path == "/api/net-batches":
+                    batch = service.generate_net_batch(self._actor(), body.get("data", {}))
+                    self._send(201, batch)
+                    return
+                confirm_match = re.match(r"^/api/net-batches/([A-Za-z0-9_\-]+)/confirm$", parsed.path)
+                if confirm_match:
+                    batch = service.confirm_net_batch(self._actor(), confirm_match.group(1))
+                    self._send(200, batch)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:

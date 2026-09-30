@@ -3,6 +3,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 
+DEFAULT_ACCOUNT = "DEFAULT"
+CURRENCIES = ["CNY", "USD", "HKD"]
+
+
 class DomainError(Exception):
     status = 400
     code = "domain_error"
@@ -21,6 +25,10 @@ class NotFound(DomainError):
 class Conflict(DomainError):
     status = 409
     code = "conflict"
+
+    def __init__(self, message: str, details: Any = None) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 class PermissionDenied(DomainError):
