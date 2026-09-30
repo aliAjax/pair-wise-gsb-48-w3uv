@@ -7,6 +7,10 @@ class DomainError(Exception):
     status = 400
     code = "domain_error"
 
+    def __init__(self, message: str = "", details: Any = None) -> None:
+        super().__init__(message)
+        self.details = details
+
 
 class ValidationError(DomainError):
     status = 422

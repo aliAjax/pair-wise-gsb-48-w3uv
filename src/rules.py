@@ -1,7 +1,7 @@
 """证券结算与企业行动处理领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, optional_text, text, text_list
 
 
 INITIAL_STATE = "captured"
@@ -9,12 +9,56 @@ CREATE_ROLES = {'trader'}
 ACTION_ROLES = {'apply_corporate': {'corporate_actions'}, 'approve': {'settlement_officer'}, 'settle': {'settlement_officer'}, 'fail': {'settlement_officer'}, 'reverse': {'corporate_actions', 'settlement_officer'}}
 TRANSITIONS = {'apply_corporate': {'captured': 'adjusted'}, 'approve': {'captured': 'approved', 'adjusted': 'approved'}, 'settle': {'approved': 'settled'}, 'fail': {'approved': 'failed'}, 'reverse': {'settled': 'reversed', 'failed': 'reversed'}}
 
+CURRENCIES = ["CNY", "USD", "HKD"]
+CA_ACTION_TYPES = ["none", "split", "dividend", "merger"]
+BATCHABLE_STATES = {"captured", "adjusted", "approved"}
+GENERATE_BATCH_ROLES = {'settlement_officer', 'settlement_supervisor'}
+CONFIRM_BATCH_ROLES = {'settlement_supervisor'}
+REGISTER_CA_ROLES = {'corporate_actions'}
+TERMINAL_GUARD_ACTIONS = {"settle", "fail", "reverse"}
+
+
+def effective_position(quantity: int, action_type: str, ratio: float) -> Tuple[int, float]:
+    """按公司行动参数折算证券数量与现金权益。"""
+    if action_type in ("split", "merger"):
+        return int(quantity * ratio), 0.0
+    if action_type == "dividend":
+        return int(quantity), round(quantity * ratio, 2)
+    return int(quantity), 0.0
+
+
+def batch_item(payload: Dict[str, Any], ca_version: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """把结算指令折算成批次明细：采用的公司行动版本随明细冻结，净收付数量正收负付。"""
+    action_type = ca_version["action_type"] if ca_version else "none"
+    ratio = float(ca_version["ratio"]) if ca_version else 1.0
+    adjusted, entitlement = effective_position(int(payload["quantity"]), action_type, ratio)
+    base = float(payload["net_amount"])
+    cash = -base if payload["side"] == "buy" else base
+    cash += entitlement
+    return {
+        "instrument": payload["instrument"],
+        "side": payload["side"],
+        "ca_version": int(ca_version["version"]) if ca_version else None,
+        "net_quantity": adjusted if payload["side"] == "buy" else -adjusted,
+        "net_amount": round(cash, 2),
+    }
+
+
+def net_totals(items: List[Dict[str, Any]]) -> Tuple[Dict[str, int], float]:
+    """按标的汇总净证券数量，并计算批次净现金（正收负付）。"""
+    quantities: Dict[str, int] = {}
+    cash = 0.0
+    for item in items:
+        quantities[item["instrument"]] = quantities.get(item["instrument"], 0) + int(item["net_quantity"])
+        cash += float(item["net_amount"])
+    return quantities, round(cash, 2)
+
 
 class DomainRules:
     INITIAL_STATE = INITIAL_STATE
 
     def known_role(self, role: str) -> bool:
-        all_roles = set(CREATE_ROLES)
+        all_roles = set(CREATE_ROLES) | GENERATE_BATCH_ROLES | CONFIRM_BATCH_ROLES | REGISTER_CA_ROLES
         for roles in ACTION_ROLES.values():
             all_roles.update(roles)
         return role == "admin" or role in all_roles
@@ -25,6 +69,15 @@ class DomainRules:
     def role_can_action(self, role: str, action: str) -> bool:
         return role == "admin" or role in ACTION_ROLES.get(action, set())
 
+    def role_can_generate_batch(self, role: str) -> bool:
+        return role == "admin" or role in GENERATE_BATCH_ROLES
+
+    def role_can_confirm_batch(self, role: str) -> bool:
+        return role == "admin" or role in CONFIRM_BATCH_ROLES
+
+    def role_can_register_ca(self, role: str) -> bool:
+        return role == "admin" or role in REGISTER_CA_ROLES
+
     def validate_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         p = dict(payload)
         text(p, "instrument")
@@ -32,10 +85,11 @@ class DomainRules:
         integer(p, "quantity", 1)
         number(p, "price", 0.01)
         number(p, "fees", 0)
-        choice(p, "currency", ["CNY", "USD", "HKD"])
+        choice(p, "currency", CURRENCIES)
         integer(p, "settlement_day", 0)
-        choice(p, "corporate_action", ["none", "split", "dividend", "merger"])
+        choice(p, "corporate_action", CA_ACTION_TYPES)
         number(p, "action_ratio", 0.01)
+        p["account"] = optional_text(p, "account", "DEFAULT") or "DEFAULT"
         return p
 
     def prepare_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -100,3 +154,23 @@ class DomainRules:
             summary = "交收冲正"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    def validate_ca_registration(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(data or {})
+        instrument = text(data, "instrument")
+        action_type = choice(data, "action_type", CA_ACTION_TYPES)
+        if action_type == "none":
+            ratio_value = data.get("ratio", 1.0)
+            ratio = 1.0 if ratio_value is None else number({"ratio": ratio_value}, "ratio", 0.01)
+        else:
+            ratio = number(data, "ratio", 0.01)
+        return {"instrument": instrument, "action_type": action_type, "ratio": ratio, "note": optional_text(data, "note")}
+
+    def validate_batch_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(data or {})
+        return {
+            "batch_no": text(data, "batch_no"),
+            "account": text(data, "account"),
+            "currency": choice(data, "currency", CURRENCIES),
+            "settlement_day": integer(data, "settlement_day", 0),
+        }
